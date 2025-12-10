@@ -3,7 +3,7 @@ import json
 import re
 import sqlite3
 from pathlib import Path
-from datetime import datetime, date, timedelta
+from datetime import datetime, date, timedelta, timezone
 from collections import defaultdict
 from typing import Optional
 
@@ -80,7 +80,7 @@ def load_records_from_har_bytes(har_bytes: bytes, override_date: Optional[date] 
                 body = json.loads(body_text)
                 stime = body.get("stime")
                 if stime:
-                    dt_stime = datetime.utcfromtimestamp(stime) + timedelta(days=1)
+                    dt_stime = datetime.fromtimestamp(stime, tz=timezone.utc) + timedelta(days=1)
                     stime_date = dt_stime.date()
             except Exception:
                 pass
@@ -140,12 +140,35 @@ def load_records_from_har_bytes(har_bytes: bytes, override_date: Optional[date] 
             pot_eur = pot_cent / 100.0
             stake_label = refs.get(str(level_id), level_labels.get(level_id, f"Level {level_id}"))
 
+            # Try to detect if `table_id` actually encodes a unix timestamp.
+            unix_date_val = None
+            try:
+                if isinstance(table_id, int):
+                    # If value looks like milliseconds epoch (>= 1e12), convert to seconds
+                    if table_id >= 10 ** 12:
+                        unix_date_val = table_id // 1000
+                    # If value looks like seconds epoch (>= 1e9), accept as seconds
+                    elif table_id >= 10 ** 9:
+                        unix_date_val = table_id
+            except Exception:
+                unix_date_val = None
+
+            # If we detected a unix timestamp, prefer that for `date` and `month` (UTC)
+            if unix_date_val is not None:
+                try:
+                    dt_unix = datetime.fromtimestamp(int(unix_date_val), tz=timezone.utc)
+                    day_str = dt_unix.strftime("%Y-%m-%d")
+                    month_str = dt_unix.strftime("%Y-%m")
+                except Exception:
+                    # fallback: keep previously computed day_str/month_str
+                    pass
+
             records.append({
                 "hand_id": hand_id,
                 "date": day_str,
                 "month": month_str,
                 "stake": stake_label,
-                "table_id": table_id,
+                "unix_date": unix_date_val,
                 "cards": cards,
                 "pot_eur": pot_eur,
                 "result_eur": result_eur,
@@ -170,7 +193,7 @@ def init_db(conn: sqlite3.Connection):
                 date       TEXT,
                 month      TEXT,
                 stake      TEXT,
-                table_id   INTEGER,
+                unix_date  INTEGER,
                 cards      TEXT,
                 pot_eur    REAL,
                 result_eur REAL
@@ -179,6 +202,41 @@ def init_db(conn: sqlite3.Connection):
         conn.execute("CREATE INDEX IF NOT EXISTS idx_hands_date ON hands(date)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_hands_month ON hands(month)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_hands_stake ON hands(stake)")
+        # Migration: if an older DB has `table_id` column, try renaming it to `unix_date`.
+        try:
+            cur = conn.execute("PRAGMA table_info(hands)")
+            cols = {row[1] for row in cur.fetchall()}
+            if "table_id" in cols and "unix_date" not in cols:
+                try:
+                    conn.execute("ALTER TABLE hands RENAME COLUMN table_id TO unix_date")
+                except Exception:
+                    # If RENAME COLUMN isn't supported, attempt a manual copy migration
+                    conn.execute("BEGIN")
+                    conn.execute("ALTER TABLE hands RENAME TO hands_old")
+                    conn.execute("""
+                        CREATE TABLE hands (
+                            hand_id    INTEGER PRIMARY KEY,
+                            date       TEXT,
+                            month      TEXT,
+                            stake      TEXT,
+                            unix_date  INTEGER,
+                            cards      TEXT,
+                            pot_eur    REAL,
+                            result_eur REAL
+                        )
+                    """)
+                    # copy data, using table_id -> unix_date
+                    conn.execute("INSERT INTO hands (hand_id, date, month, stake, unix_date, cards, pot_eur, result_eur) SELECT hand_id, date, month, stake, table_id, cards, pot_eur, result_eur FROM hands_old")
+                    conn.execute("DROP TABLE hands_old")
+                    conn.execute("COMMIT")
+        except Exception:
+            # If anything goes wrong, don't block startup; keep original schema
+            pass
+        # Try to create unix_date index if the column exists; ignore errors if it doesn't
+        try:
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_hands_unix_date ON hands(unix_date)")
+        except Exception:
+            pass
 
 
 def insert_hands(conn: sqlite3.Connection, records):
@@ -188,10 +246,10 @@ def insert_hands(conn: sqlite3.Connection, records):
         before = conn.total_changes
         conn.executemany("""
             INSERT OR IGNORE INTO hands
-            (hand_id, date, month, stake, table_id, cards, pot_eur, result_eur)
+            (hand_id, date, month, stake, unix_date, cards, pot_eur, result_eur)
             VALUES (?, ?, ?, ?, ?, ?, ?, ?)
         """, [
-            (r["hand_id"], r["date"], r["month"], r["stake"], r["table_id"], r["cards"], r["pot_eur"], r["result_eur"])
+            (r["hand_id"], r["date"], r["month"], r["stake"], r.get("unix_date"), r["cards"], r["pot_eur"], r["result_eur"])
             for r in records
         ])
         after = conn.total_changes
@@ -204,7 +262,7 @@ def load_all_hands_cached(db_path_str: str, db_mtime: float):
     conn.row_factory = sqlite3.Row
     try:
         rows = conn.execute(
-            "SELECT hand_id, date, month, stake, table_id, cards, pot_eur, result_eur FROM hands"
+            "SELECT hand_id, date, month, stake, unix_date, cards, pot_eur, result_eur FROM hands"
         ).fetchall()
     finally:
         conn.close()
@@ -380,15 +438,31 @@ def main():
 
     # --- PER DAG ---
     if view == "Per dag":
+        # build date->records mapping so we can compute estimated rakeback per-day
+        from collections import defaultdict as _dd
+        records_by_date = _dd(list)
+        for r in all_hands:
+            if r.get("date"):
+                records_by_date[r["date"]].append(r)
+
         per_date = aggregate_by_date(all_hands)
-        dates = sorted(per_date.keys(), reverse=True) # Senaste först
+        dates = sorted(per_date.keys(), reverse=True)  # Senaste först
         chosen = st.selectbox("Datum", dates)
         agg = per_date[chosen]
         st.header(f"Datum: {chosen}")
-        col1, col2, col3 = st.columns(3)
+        col1, col2, col3, col4 = st.columns(4)
         col1.metric("Resultat (€)", f"{agg['result_eur']:.2f}")
         col2.metric("Händer", agg["hands"])
         col3.metric("BB/100", f"{agg['bb100']:.2f}")
+
+        # estimate rakeback for this day's records
+        day_records = records_by_date.get(chosen, [])
+        if day_records:
+            _, day_totals = estimate_rake_per_stake_summary(day_records, nl_rake_bb100, plo_rake_bb100, rakeback_pct)
+            est_rb = day_totals.get("total_est_rakeback_eur", 0.0)
+            col4.metric("Est. rakeback (EUR)", f"{est_rb:.2f}")
+        else:
+            col4.metric("Est. rakeback (EUR)", "0.00")
         rows = []
         for stake, info in agg["stakes"].items():
             rows.append({"Stake": fix_encoding(stake), "Händer": info["hands"],
@@ -398,15 +472,31 @@ def main():
 
     # --- PER MÅNAD ---
     elif view == "Per månad":
+        # build month->records mapping for rakeback estimation
+        from collections import defaultdict as _dd
+        records_by_month = _dd(list)
+        for r in all_hands:
+            if r.get("month"):
+                records_by_month[r["month"]].append(r)
+
         per_month = aggregate_by_month(all_hands)
-        months = sorted(per_month.keys())
+        months = sorted(per_month.keys(), reverse=True)
         chosen = st.selectbox("Månad", months)
         agg = per_month[chosen]
         st.header(f"Månad: {chosen}")
-        col1, col2, col3 = st.columns(3)
+        col1, col2, col3, col4 = st.columns(4)
         col1.metric("Resultat (€)", f"{agg['result_eur']:.2f}")
         col2.metric("Händer", agg["hands"])
         col3.metric("BB/100", f"{agg['bb100']:.2f}")
+
+        # estimate rakeback for this month's records
+        month_records = records_by_month.get(chosen, [])
+        if month_records:
+            _, month_totals = estimate_rake_per_stake_summary(month_records, nl_rake_bb100, plo_rake_bb100, rakeback_pct)
+            est_rb_m = month_totals.get("total_est_rakeback_eur", 0.0)
+            col4.metric("Est. rakeback (EUR)", f"{est_rb_m:.2f}")
+        else:
+            col4.metric("Est. rakeback (EUR)", "0.00")
         rows = []
         for stake, info in agg["stakes"].items():
             rows.append({"Stake": fix_encoding(stake), "Händer": info["hands"],
@@ -475,7 +565,6 @@ def main():
                 df_f["BB"] = df_f["Result (€)"] / df_f["BB_size"]
                 df_f["Pott (€)"] = df_f["pot_eur"]
                 df_f["Hand ID"] = df_f["hand_id"]
-                df_f["Bord"] = df_f["table_id"]
                 sort_map = {"Pott (€)": "Pott (€)", "Result (€)": "Result (€)", "Datum": "Datum", "Hand ID": "Hand ID"}
                 sort_key = sort_map.get(sort_col, "Pott (€)")
                 df_f = df_f.sort_values(sort_key, ascending=False)
@@ -486,8 +575,26 @@ def main():
                 df_view["BB"] = df_view["BB"].round(2)
                 df_view["Pott (€)"] = df_view["Pott (€)"].round(2)
                 df_view["Datum_str"] = df_view["Datum"].dt.strftime("%Y-%m-%d %H:%M:%S")
-                out_cols = ["Datum_str", "Hand ID", "Stake_label", "Bord", "Kort", "Pott (€)", "Result (€)", "BB"]
-                df_out = df_view[out_cols].rename(columns={"Datum_str": "Datum", "Stake_label": "Stake"})
+                # human-readable unix date (if present)
+                def _fmt_unix(u):
+                    try:
+                        if u is None or (isinstance(u, float) and pd.isna(u)):
+                            return ""
+                        # values may be floats from pandas; ensure int
+                        u_int = int(u)
+                        # if value is clearly in ms, convert
+                        if u_int >= 10 ** 12:
+                            u_int = u_int // 1000
+                        # convert to UTC timestamp string
+                        return datetime.fromtimestamp(u_int, tz=timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+                    except Exception:
+                        return str(u)
+
+                df_view["Unix_date"] = df_view.get("unix_date").apply(_fmt_unix)
+                out_cols = ["Datum_str", "Hand ID", "Stake_label", "Kort", "Pott (€)", "Result (€)", "BB"]
+                # insert Unix_date right after Datum
+                out_cols = ["Datum_str", "Unix_date"] + out_cols[1:]
+                df_out = df_view[out_cols].rename(columns={"Datum_str": "Datum", "Stake_label": "Stake", "Unix_date": "Unix date (UTC)"})
                 st.caption(f"Visar {len(df_out)} av {total_matches} händer (filtrerade och begränsade).")
                 html_table = df_out.to_html(escape=False, index=False)
                 st.markdown(html_table, unsafe_allow_html=True)
