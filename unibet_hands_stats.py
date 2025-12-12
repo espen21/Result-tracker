@@ -58,153 +58,10 @@ def format_cards_pretty_html(cards: str) -> str:
     return " ".join(pieces)
 
 
-def unix_sort_key(u) -> int:
-    """Unix i sekunder (hanterar ms). Returnerar -1 om ogiltig."""
-    try:
-        u_int = int(u)
-        return u_int // 1000 if u_int >= 10**12 else u_int
-    except Exception:
-        return -1
-
-
-def unix_to_utc_str(u) -> str:
-    """Unix -> 'YYYY-MM-DD HH:MM:SS' (UTC). Tom str om ogiltig."""
-    k = unix_sort_key(u)
-    if k < 0:
-        return ""
-    return datetime.fromtimestamp(k, tz=timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
-
-
-# -------------------- Rake-estimat funktioner (parametriserade) -------------------- #
-
-def get_rake_bb100_for_label(label: str, nl_default: float, plo_default: float) -> float:
-    """Returnerar vilken BB/100 rake som bör användas för en stake-label."""
-    if not isinstance(label, str):
-        return nl_default
-    s = label.lower()
-    if "pl" in s or "plo" in s:
-        return plo_default
-    return nl_default
-
-
-def rakeback_for_hand_eur(stake_label: str, nl_rake_bb100: float, plo_rake_bb100: float, rakeback_pct: float) -> float:
-    bb_size = parse_big_blind_eur(stake_label) or 1.0
-    rake_bb100 = get_rake_bb100_for_label(stake_label, nl_rake_bb100, plo_rake_bb100)
-    rake_per_hand_eur = (rake_bb100 / 100.0) * bb_size
-    return rake_per_hand_eur * rakeback_pct
-
-
-def estimate_rake_per_stake_summary(records, nl_rake_bb100: float, plo_rake_bb100: float, rakeback_pct: float):
-    """
-    Summerar per stake:
-      - hands
-      - result_eur
-      - est_rake_eur
-      - est_rakeback_eur
-      - est_rakeback_bb100 (rake_bb100 * rakeback_pct)
-    Returnerar dict stake->stats och totals.
-    """
-    per = {}
-    total_result = 0.0
-    total_rake = 0.0
-    for r in records:
-        stake = r.get("stake")
-        if stake not in per:
-            per[stake] = {"hands": 0, "result_eur": 0.0, "est_rake_eur": 0.0}
-        per[stake]["hands"] += 1
-        per[stake]["result_eur"] += r.get("result_eur", 0.0)
-
-        bb_size = parse_big_blind_eur(stake) or 1.0
-        rake_bb100 = get_rake_bb100_for_label(stake, nl_rake_bb100, plo_rake_bb100)
-        rake_per_hand_eur = (rake_bb100 / 100.0) * bb_size
-        per[stake]["est_rake_eur"] += rake_per_hand_eur
-
-        total_result += r.get("result_eur", 0.0)
-        total_rake += rake_per_hand_eur
-
-    per_out = {}
-    for stake, v in per.items():
-        rake_bb100 = get_rake_bb100_for_label(stake, nl_rake_bb100, plo_rake_bb100)
-        est_rakeback_bb100 = rake_bb100 * rakeback_pct
-        est_rakeback_eur = v["est_rake_eur"] * rakeback_pct
-        per_out[stake] = {
-            "hands": v["hands"],
-            "result_eur": v["result_eur"],
-            "est_rake_eur": v["est_rake_eur"],
-            "est_rakeback_eur": est_rakeback_eur,
-            "est_rakeback_bb100": est_rakeback_bb100,
-            "rake_bb100": rake_bb100,
-        }
-
-    totals = {
-        "total_result_eur": total_result,
-        "total_est_rake_eur": total_rake,
-        "total_est_rakeback_eur": total_rake * rakeback_pct
-    }
-    return per_out, totals
-
-
-def compute_played_hours_and_hourly(records, nl_rake_bb100: float, plo_rake_bb100: float, rakeback_pct: float):
-    """
-    Speltid = (sista_hand_tid - första_hand_tid) i urvalet.
-    Timlön = (resultat + est rakeback) / speltid.
-    """
-    if not records:
-        return {
-            "played_hours": 0.0,
-            "start_utc": "",
-            "end_utc": "",
-            "total_result_eur": 0.0,
-            "total_rakeback_eur": 0.0,
-            "total_with_rakeback_eur": 0.0,
-            "hourly_eur_per_h": 0.0,
-        }
-
-    ts = [unix_sort_key(r.get("unix_date")) for r in records]
-    ts = [t for t in ts if t >= 0]
-    if not ts:
-        return {
-            "played_hours": 0.0,
-            "start_utc": "",
-            "end_utc": "",
-            "total_result_eur": 0.0,
-            "total_rakeback_eur": 0.0,
-            "total_with_rakeback_eur": 0.0,
-            "hourly_eur_per_h": 0.0,
-        }
-
-    t0, t1 = min(ts), max(ts)
-    played_hours = max(0.0, (t1 - t0) / 3600.0)
-    start_utc = datetime.fromtimestamp(t0, tz=timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
-    end_utc = datetime.fromtimestamp(t1, tz=timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
-
-    total_result = 0.0
-    total_rb = 0.0
-    for r in records:
-        total_result += float(r.get("result_eur", 0.0))
-        total_rb += float(rakeback_for_hand_eur(r.get("stake"), nl_rake_bb100, plo_rake_bb100, rakeback_pct))
-
-    total_with_rb = total_result + total_rb
-    hourly = (total_with_rb / played_hours) if played_hours > 0 else 0.0
-
-    return {
-        "played_hours": played_hours,
-        "start_utc": start_utc,
-        "end_utc": end_utc,
-        "total_result_eur": total_result,
-        "total_rakeback_eur": total_rb,
-        "total_with_rakeback_eur": total_with_rb,
-        "hourly_eur_per_h": hourly,
-    }
-
-
-# ----------------------- Import HAR ----------------------- #
-
 def load_records_from_har_bytes(har_bytes: bytes, override_date: Optional[date] = None):
     """
     Läser händer ur HAR -> returnerar lista med records.
     Datum prioritering: override_date -> stime+1d -> startedDateTime.
-    Om unix_date finns används den (UTC) för date/month.
     """
     har = json.loads(har_bytes.decode("utf-8"))
     entries = har.get("log", {}).get("entries", [])
@@ -272,9 +129,9 @@ def load_records_from_har_bytes(har_bytes: bytes, override_date: Optional[date] 
                 continue
             hand_id = h[0]
             saldo_before = h[1]
-            unix_date = h[2]
             pot_cent = h[3]
             level_id = h[5]
+            table_id = h[6]
             cards = h[7]
             saldo_after = h[8]
 
@@ -283,20 +140,35 @@ def load_records_from_har_bytes(har_bytes: bytes, override_date: Optional[date] 
             pot_eur = pot_cent / 100.0
             stake_label = refs.get(str(level_id), level_labels.get(level_id, f"Level {level_id}"))
 
-            # Om unix_date finns: använd den för date/month (UTC)
-            if unix_date is not None:
-                k = unix_sort_key(unix_date)
-                if k >= 0:
-                    dt_unix = datetime.fromtimestamp(k, tz=timezone.utc)
+            # Try to detect if `table_id` actually encodes a unix timestamp.
+            unix_date_val = None
+            try:
+                if isinstance(table_id, int):
+                    # If value looks like milliseconds epoch (>= 1e12), convert to seconds
+                    if table_id >= 10 ** 12:
+                        unix_date_val = table_id // 1000
+                    # If value looks like seconds epoch (>= 1e9), accept as seconds
+                    elif table_id >= 10 ** 9:
+                        unix_date_val = table_id
+            except Exception:
+                unix_date_val = None
+
+            # If we detected a unix timestamp, prefer that for `date` and `month` (UTC)
+            if unix_date_val is not None:
+                try:
+                    dt_unix = datetime.fromtimestamp(int(unix_date_val), tz=timezone.utc)
                     day_str = dt_unix.strftime("%Y-%m-%d")
                     month_str = dt_unix.strftime("%Y-%m")
+                except Exception:
+                    # fallback: keep previously computed day_str/month_str
+                    pass
 
             records.append({
                 "hand_id": hand_id,
                 "date": day_str,
                 "month": month_str,
                 "stake": stake_label,
-                "unix_date": unix_date,
+                "unix_date": unix_date_val,
                 "cards": cards,
                 "pot_eur": pot_eur,
                 "result_eur": result_eur,
@@ -330,6 +202,41 @@ def init_db(conn: sqlite3.Connection):
         conn.execute("CREATE INDEX IF NOT EXISTS idx_hands_date ON hands(date)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_hands_month ON hands(month)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_hands_stake ON hands(stake)")
+        # Migration: if an older DB has `table_id` column, try renaming it to `unix_date`.
+        try:
+            cur = conn.execute("PRAGMA table_info(hands)")
+            cols = {row[1] for row in cur.fetchall()}
+            if "table_id" in cols and "unix_date" not in cols:
+                try:
+                    conn.execute("ALTER TABLE hands RENAME COLUMN table_id TO unix_date")
+                except Exception:
+                    # If RENAME COLUMN isn't supported, attempt a manual copy migration
+                    conn.execute("BEGIN")
+                    conn.execute("ALTER TABLE hands RENAME TO hands_old")
+                    conn.execute("""
+                        CREATE TABLE hands (
+                            hand_id    INTEGER PRIMARY KEY,
+                            date       TEXT,
+                            month      TEXT,
+                            stake      TEXT,
+                            unix_date  INTEGER,
+                            cards      TEXT,
+                            pot_eur    REAL,
+                            result_eur REAL
+                        )
+                    """)
+                    # copy data, using table_id -> unix_date
+                    conn.execute("INSERT INTO hands (hand_id, date, month, stake, unix_date, cards, pot_eur, result_eur) SELECT hand_id, date, month, stake, table_id, cards, pot_eur, result_eur FROM hands_old")
+                    conn.execute("DROP TABLE hands_old")
+                    conn.execute("COMMIT")
+        except Exception:
+            # If anything goes wrong, don't block startup; keep original schema
+            pass
+        # Try to create unix_date index if the column exists; ignore errors if it doesn't
+        try:
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_hands_unix_date ON hands(unix_date)")
+        except Exception:
+            pass
 
 
 def insert_hands(conn: sqlite3.Connection, records):
@@ -360,6 +267,71 @@ def load_all_hands_cached(db_path_str: str, db_mtime: float):
     finally:
         conn.close()
     return [dict(r) for r in rows]
+
+
+# -------------------- Rake-estimat funktioner (parametriserade) -------------------- #
+
+def get_rake_bb100_for_label(label: str, nl_default: float, plo_default: float) -> float:
+    """Returnerar vilken BB/100 rake som bör användas för en stake-label."""
+    if not isinstance(label, str):
+        return nl_default
+    s = label.lower()
+    if "pl" in s or "plo" in s:
+        return plo_default
+    return nl_default
+
+
+def estimate_rake_per_stake_summary(records, nl_rake_bb100: float, plo_rake_bb100: float, rakeback_pct: float):
+    """
+    Summerar per stake:
+      - hands
+      - result_eur
+      - est_rake_eur
+      - est_rakeback_eur
+      - est_rakeback_bb100 (rake_bb100 * rakeback_pct)
+    Returnerar dict stake->stats och totals.
+    """
+    per = {}
+    total_result = 0.0
+    total_rake = 0.0
+    for r in records:
+        stake = r.get("stake")
+        if stake not in per:
+            per[stake] = {"hands": 0, "result_eur": 0.0, "est_rake_eur": 0.0}
+        per[stake]["hands"] += 1
+        per[stake]["result_eur"] += r.get("result_eur", 0.0)
+
+        bb_size = parse_big_blind_eur(stake) or 1.0
+        rake_bb100 = get_rake_bb100_for_label(stake, nl_rake_bb100, plo_rake_bb100)
+        # rake per hand in euro
+        rake_per_hand_eur = (rake_bb100 / 100.0) * bb_size
+        per[stake]["est_rake_eur"] += rake_per_hand_eur
+
+        total_result += r.get("result_eur", 0.0)
+        total_rake += rake_per_hand_eur
+
+    # compute per-stake additional fields
+    per_out = {}
+    for stake, v in per.items():
+        rake_bb100 = get_rake_bb100_for_label(stake, nl_rake_bb100, plo_rake_bb100)
+        est_rakeback_bb100 = rake_bb100 * rakeback_pct
+        est_rakeback_eur = v["est_rake_eur"] * rakeback_pct
+        per_out[stake] = {
+            "hands": v["hands"],
+            "result_eur": v["result_eur"],
+            "est_rake_eur": v["est_rake_eur"],
+            "est_rakeback_eur": est_rakeback_eur,
+            "est_rakeback_bb100": est_rakeback_bb100,
+            "rake_bb100": rake_bb100,
+        }
+
+    totals = {
+        "total_result_eur": total_result,
+        "total_est_rake_eur": total_rake,
+        "total_est_rakeback_eur": total_rake * rakeback_pct
+    }
+
+    return per_out, totals
 
 
 # ----------------------- Aggregat-funktioner ----------------------- #
@@ -449,7 +421,11 @@ def main():
             st.sidebar.success(f"{uf.name}: {added} nya händer")
         st.sidebar.info(f"Totalt nya händer denna import: {total_added}")
 
-    db_mtime = db_path.stat().st_mtime if db_path.exists() else 0.0
+    if db_path.exists():
+        db_mtime = db_path.stat().st_mtime
+    else:
+        db_mtime = 0.0
+
     all_hands = load_all_hands_cached(str(db_path), db_mtime)
     if not all_hands:
         st.info("Inga händer i databasen ännu. Importera en HAR-fil.")
@@ -457,36 +433,29 @@ def main():
 
     st.sidebar.write(f"Totalt antal händer: **{len(all_hands)}**")
 
-    view = st.radio(
-        "Vy",
-        [
-            "Per dag",
-            "Per månad",
-            "Alla dagar (tabell + grafer)",
-            "Alla händer (sortable)",
-            "Graf – kumulativ resultatkurva",
-            "Total (alla händer)"
-        ],
-    )
+    view = st.radio("Vy", ["Per dag", "Per månad", "Alla dagar (tabell + grafer)", "Alla händer (sortable)",
+                          "Graf – kumulativ resultatkurva", "Total (alla händer)"])
 
     # --- PER DAG ---
     if view == "Per dag":
-        records_by_date = defaultdict(list)
+        # build date->records mapping so we can compute estimated rakeback per-day
+        from collections import defaultdict as _dd
+        records_by_date = _dd(list)
         for r in all_hands:
             if r.get("date"):
                 records_by_date[r["date"]].append(r)
 
         per_date = aggregate_by_date(all_hands)
-        dates = sorted(per_date.keys(), reverse=True)
+        dates = sorted(per_date.keys(), reverse=True)  # Senaste först
         chosen = st.selectbox("Datum", dates)
         agg = per_date[chosen]
-
         st.header(f"Datum: {chosen}")
         col1, col2, col3, col4 = st.columns(4)
         col1.metric("Resultat (€)", f"{agg['result_eur']:.2f}")
         col2.metric("Händer", agg["hands"])
         col3.metric("BB/100", f"{agg['bb100']:.2f}")
 
+        # estimate rakeback for this day's records
         day_records = records_by_date.get(chosen, [])
         if day_records:
             _, day_totals = estimate_rake_per_stake_summary(day_records, nl_rake_bb100, plo_rake_bb100, rakeback_pct)
@@ -494,28 +463,18 @@ def main():
             col4.metric("Est. rakeback (EUR)", f"{est_rb:.2f}")
         else:
             col4.metric("Est. rakeback (EUR)", "0.00")
-
-        # Timlön (spelad tid = första→sista hand i urvalet)
-        stats = compute_played_hours_and_hourly(day_records, nl_rake_bb100, plo_rake_bb100, rakeback_pct)
-        colA, colB, colC = st.columns(3)
-        colA.metric("Speltid (h)", f"{stats['played_hours']:.2f}")
-        colB.metric("Timlön (€/h) inkl rakeback", f"{stats['hourly_eur_per_h']:.2f}")
-        colC.metric("Start→Slut (UTC)", f"{stats['start_utc']} → {stats['end_utc']}")
-
         rows = []
         for stake, info in agg["stakes"].items():
-            rows.append({
-                "Stake": fix_encoding(stake),
-                "Händer": info["hands"],
-                "Result (€)": round(info["result_eur"], 2),
-                "BB/100": round(info["bb100"], 2),
-            })
+            rows.append({"Stake": fix_encoding(stake), "Händer": info["hands"],
+                         "Result (€)": round(info["result_eur"], 2), "BB/100": round(info["bb100"], 2)})
         st.subheader("Per stake")
         st.table(pd.DataFrame(rows))
 
     # --- PER MÅNAD ---
     elif view == "Per månad":
-        records_by_month = defaultdict(list)
+        # build month->records mapping for rakeback estimation
+        from collections import defaultdict as _dd
+        records_by_month = _dd(list)
         for r in all_hands:
             if r.get("month"):
                 records_by_month[r["month"]].append(r)
@@ -524,13 +483,13 @@ def main():
         months = sorted(per_month.keys(), reverse=True)
         chosen = st.selectbox("Månad", months)
         agg = per_month[chosen]
-
         st.header(f"Månad: {chosen}")
         col1, col2, col3, col4 = st.columns(4)
         col1.metric("Resultat (€)", f"{agg['result_eur']:.2f}")
         col2.metric("Händer", agg["hands"])
         col3.metric("BB/100", f"{agg['bb100']:.2f}")
 
+        # estimate rakeback for this month's records
         month_records = records_by_month.get(chosen, [])
         if month_records:
             _, month_totals = estimate_rake_per_stake_summary(month_records, nl_rake_bb100, plo_rake_bb100, rakeback_pct)
@@ -538,22 +497,10 @@ def main():
             col4.metric("Est. rakeback (EUR)", f"{est_rb_m:.2f}")
         else:
             col4.metric("Est. rakeback (EUR)", "0.00")
-
-        # Timlön
-        stats = compute_played_hours_and_hourly(month_records, nl_rake_bb100, plo_rake_bb100, rakeback_pct)
-        colA, colB, colC = st.columns(3)
-        colA.metric("Speltid (h)", f"{stats['played_hours']:.2f}")
-        colB.metric("Timlön (€/h) inkl rakeback", f"{stats['hourly_eur_per_h']:.2f}")
-        colC.metric("Start→Slut (UTC)", f"{stats['start_utc']} → {stats['end_utc']}")
-
         rows = []
         for stake, info in agg["stakes"].items():
-            rows.append({
-                "Stake": fix_encoding(stake),
-                "Händer": info["hands"],
-                "Result (€)": round(info["result_eur"], 2),
-                "BB/100": round(info["bb100"], 2),
-            })
+            rows.append({"Stake": fix_encoding(stake), "Händer": info["hands"],
+                         "Result (€)": round(info["result_eur"], 2), "BB/100": round(info["bb100"], 2)})
         st.subheader("Per stake")
         st.table(pd.DataFrame(rows))
 
@@ -562,16 +509,11 @@ def main():
         per_date = aggregate_by_date(all_hands)
         rows = []
         for d, agg in per_date.items():
-            rows.append({
-                "Datum": d,
-                "Händer": agg["hands"],
-                "Result (€)": round(agg["result_eur"], 2),
-                "BB/100": round(agg["bb100"], 2),
-            })
+            rows.append({"Datum": d, "Händer": agg["hands"], "Result (€)": round(agg["result_eur"], 2),
+                         "BB/100": round(agg["bb100"], 2)})
         df = pd.DataFrame(rows).sort_values("Datum")
         st.subheader("Tabell per dag")
         st.table(df)
-
         df_plot = df.copy()
         df_plot["Datum"] = pd.to_datetime(df_plot["Datum"], errors="coerce")
         df_plot = df_plot.set_index("Datum").sort_index()
@@ -583,55 +525,38 @@ def main():
 
     # --- ALLA HÄNDER (FILTER + LIMIT) ---
     elif view == "Alla händer (sortable)":
-        st.header("Alla händer – sortera / filtrera (unix_date, visar bara unix_date)")
-
+        st.header("Alla händer – sortera / filtrera")
         df = pd.DataFrame(all_hands)
         if df.empty:
             st.info("Inga händer att visa.")
         else:
-            df["unix_sort"] = df["unix_date"].apply(unix_sort_key)
-            df = df[df["unix_sort"] >= 0].copy()
-
-            # UTC datetime bara för date-filter (visas inte i tabellen)
-            df["dt_utc"] = pd.to_datetime(df["unix_sort"], unit="s", utc=True, errors="coerce")
-            df["dt_utc_naive"] = df["dt_utc"].dt.tz_convert(None)
-
+            df["Datum"] = pd.to_datetime(df["date"], errors="coerce")
             df["Stake_label"] = df["stake"].apply(fix_encoding)
-
             col_f1, col_f2 = st.columns(2)
             stakes_all = sorted(df["Stake_label"].dropna().unique().tolist())
             with col_f1:
                 selected_stakes = st.multiselect("Stakefilter", stakes_all, default=stakes_all)
-
+            min_d = df["Datum"].min()
+            max_d = df["Datum"].max()
             with col_f2:
-                min_d = df["dt_utc_naive"].min()
-                max_d = df["dt_utc_naive"].max()
                 if pd.isna(min_d) or pd.isna(max_d):
                     date_range = (None, None)
                 else:
-                    date_range = st.date_input(
-                        "Datumintervall (UTC)",
-                        value=(min_d.date(), max_d.date()),
-                        min_value=min_d.date(),
-                        max_value=max_d.date(),
-                    )
-
+                    date_range = st.date_input("Datumintervall", value=(min_d.date(), max_d.date()),
+                                               min_value=min_d.date(), max_value=max_d.date())
             col_f3, col_f4 = st.columns(2)
             with col_f3:
-                sort_col = st.selectbox("Sortera på", ["Unix date", "Pott (€)", "Result (€)", "Hand ID"], index=0)
+                sort_col = st.selectbox("Sortera på", ["Pott (€)", "Result (€)", "Datum", "Hand ID"], index=0)
             with col_f4:
                 max_rows = st.slider("Max antal händer att visa", 100, 5000, 2000, step=100)
-
             df_f = df.copy()
             if selected_stakes:
                 df_f = df_f[df_f["Stake_label"].isin(selected_stakes)]
-
             if isinstance(date_range, tuple) and len(date_range) == 2:
                 start_d, end_d = date_range
                 if start_d is not None and end_d is not None:
-                    mask = (df_f["dt_utc_naive"].dt.date >= start_d) & (df_f["dt_utc_naive"].dt.date <= end_d)
+                    mask = (df_f["Datum"].dt.date >= start_d) & (df_f["Datum"].dt.date <= end_d)
                     df_f = df_f[mask]
-
             if df_f.empty:
                 st.info("Inga händer matchar filtren.")
             else:
@@ -640,45 +565,51 @@ def main():
                 df_f["BB"] = df_f["Result (€)"] / df_f["BB_size"]
                 df_f["Pott (€)"] = df_f["pot_eur"]
                 df_f["Hand ID"] = df_f["hand_id"]
-
-                sort_map = {
-                    "Unix date": "unix_sort",
-                    "Pott (€)": "Pott (€)",
-                    "Result (€)": "Result (€)",
-                    "Hand ID": "Hand ID",
-                }
-                sort_key = sort_map.get(sort_col, "unix_sort")
+                sort_map = {"Pott (€)": "Pott (€)", "Result (€)": "Result (€)", "Datum": "Datum", "Hand ID": "Hand ID"}
+                sort_key = sort_map.get(sort_col, "Pott (€)")
                 df_f = df_f.sort_values(sort_key, ascending=False)
-
                 total_matches = len(df_f)
                 df_view = df_f.head(max_rows).copy()
-
                 df_view["Kort"] = df_view["cards"].apply(format_cards_pretty_html)
                 df_view["Result (€)"] = df_view["Result (€)"].round(2)
                 df_view["BB"] = df_view["BB"].round(2)
                 df_view["Pott (€)"] = df_view["Pott (€)"].round(2)
+                df_view["Datum_str"] = df_view["Datum"].dt.strftime("%Y-%m-%d %H:%M:%S")
+                # human-readable unix date (if present)
+                def _fmt_unix(u):
+                    try:
+                        if u is None or (isinstance(u, float) and pd.isna(u)):
+                            return ""
+                        # values may be floats from pandas; ensure int
+                        u_int = int(u)
+                        # if value is clearly in ms, convert
+                        if u_int >= 10 ** 12:
+                            u_int = u_int // 1000
+                        # convert to UTC timestamp string
+                        return datetime.fromtimestamp(u_int, tz=timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+                    except Exception:
+                        return str(u)
 
-                # visar bara unix_date (UTC) som tidskolumn
-                df_view["Unix date (UTC)"] = df_view["unix_date"].apply(unix_to_utc_str)
-
-                out_cols = ["Unix date (UTC)", "Hand ID", "Stake_label", "Kort", "Pott (€)", "Result (€)", "BB"]
-                df_out = df_view[out_cols].rename(columns={"Stake_label": "Stake"})
-
+                df_view["Unix_date"] = df_view.get("unix_date").apply(_fmt_unix)
+                out_cols = ["Datum_str", "Hand ID", "Stake_label", "Kort", "Pott (€)", "Result (€)", "BB"]
+                # insert Unix_date right after Datum
+                out_cols = ["Datum_str", "Unix_date"] + out_cols[1:]
+                df_out = df_view[out_cols].rename(columns={"Datum_str": "Datum", "Stake_label": "Stake", "Unix_date": "Unix date (UTC)"})
                 st.caption(f"Visar {len(df_out)} av {total_matches} händer (filtrerade och begränsade).")
                 html_table = df_out.to_html(escape=False, index=False)
                 st.markdown(html_table, unsafe_allow_html=True)
 
     # --- KUMULATIV RESULTATKURVA (med stake-filter & ned-sampling + rakeback-line) ---
     elif view == "Graf – kumulativ resultatkurva":
-        st.header("Kumulativ resultatkurva – med stake-filter och rakeback-linje (sorterad på unix_date)")
+        st.header("Kumulativ resultatkurva – med stake-filter och rakeback-linje")
         df = pd.DataFrame(all_hands)
         if df.empty:
             st.info("Inga händer att visa.")
         else:
+            df["Datum"] = pd.to_datetime(df["date"], errors="coerce")
+            stakes_all = sorted({fix_encoding(s) for s in df["stake"].unique()})
             df["stake_label"] = df["stake"].apply(fix_encoding)
-            stakes_all = sorted(df["stake_label"].dropna().unique().tolist())
             selected_stakes = st.multiselect("Välj vilka stakes som ska ingå i grafen", stakes_all, default=stakes_all)
-
             if not selected_stakes:
                 st.info("Välj minst en stake för att se grafen.")
             else:
@@ -686,23 +617,25 @@ def main():
                 if df_sel.empty:
                     st.info("Inga händer för de valda stakesen.")
                 else:
-                    df_sel["unix_sort"] = df_sel["unix_date"].apply(unix_sort_key)
-                    df_sel = df_sel[df_sel["unix_sort"] >= 0].sort_values("unix_sort").reset_index(drop=True)
-
-                    # per-hand rakeback (i ordning)
-                    rakebacks = []
+                    df_sel = df_sel.sort_values(["Datum", "hand_id"]).reset_index(drop=True)
+                    # per-hand rake & rakeback (i ordning)
+                    per_hand = []
                     for _, r in df_sel.iterrows():
-                        rakebacks.append(
-                            rakeback_for_hand_eur(r["stake"], nl_rake_bb100, plo_rake_bb100, rakeback_pct)
-                        )
-                    df_sel["rakeback_eur"] = rakebacks
-
+                        stake_label = r["stake"]
+                        bb_size = parse_big_blind_eur(stake_label) or 1.0
+                        rake_bb100 = get_rake_bb100_for_label(stake_label, nl_rake_bb100, plo_rake_bb100)
+                        rake_per_hand_eur = (rake_bb100 / 100.0) * bb_size
+                        rakeback_per_hand_eur = rake_per_hand_eur * rakeback_pct
+                        per_hand.append((rake_per_hand_eur, rakeback_per_hand_eur))
+                    df_sel["rake_eur"] = [p[0] for p in per_hand]
+                    df_sel["rakeback_eur"] = [p[1] for p in per_hand]
                     df_sel["eur"] = df_sel["result_eur"]
                     df_sel["cum_observed"] = df_sel["eur"].cumsum()
                     df_sel["cum_rakeback"] = df_sel["rakeback_eur"].cumsum()
                     df_sel["cum_with_rakeback"] = df_sel["cum_observed"] + df_sel["cum_rakeback"]
                     df_sel["hand_index"] = range(1, len(df_sel) + 1)
 
+                    # ned-sampling
                     max_points = 5000
                     n = len(df_sel)
                     if n > max_points:
@@ -710,20 +643,19 @@ def main():
                         df_plot = df_sel.iloc[::step].copy()
                     else:
                         df_plot = df_sel
-
                     df_plot = df_plot.set_index("hand_index")
                     st.caption(f"Visar {len(df_plot)} av {n} händer (ned-samplad graf).")
 
+                    # skapa long-form för Altair
                     plot_df = pd.DataFrame({
                         "hand_index": df_plot.index,
                         "Observerat (EUR)": df_plot["cum_observed"].values,
                         "Med rakeback (EUR)": df_plot["cum_with_rakeback"].values
                     }).melt(id_vars="hand_index", var_name="serie", value_name="cum_eur")
 
-                    color_scale = alt.Scale(
-                        domain=["Observerat (EUR)", "Med rakeback (EUR)"],
-                        range=["#7ec8ff", "#0066cc"]
-                    )
+                    # altair chart med färger och legend
+                    color_scale = alt.Scale(domain=["Observerat (EUR)", "Med rakeback (EUR)"],
+                                            range=["#7ec8ff", "#0066cc"])
                     chart = alt.Chart(plot_df).mark_line().encode(
                         x="hand_index:Q",
                         y="cum_eur:Q",
@@ -731,6 +663,7 @@ def main():
                     ).properties(width=800, height=350)
                     st.altair_chart(chart, use_container_width=True)
 
+                    # BB-version (valfritt)
                     if st.checkbox("Visa kumulativ BB-version istället för EUR"):
                         df_sel["bb_size"] = df_sel["stake"].apply(lambda s: parse_big_blind_eur(s) or 1.0)
                         df_sel["bb_per_hand"] = df_sel["eur"] / df_sel["bb_size"]
@@ -742,18 +675,14 @@ def main():
                             df_plot_bb = df_sel.iloc[::step].copy()
                         else:
                             df_plot_bb = df_sel
-
                         df_plot_bb = df_plot_bb.set_index("hand_index")
                         plot_bb_df = pd.DataFrame({
                             "hand_index": df_plot_bb.index,
                             "Observerat (BB cumulative)": df_plot_bb["cum_bb_observed"].values,
                             "Med rakeback (BB cumulative)": df_plot_bb["cum_bb_with_rakeback"].values
                         }).melt(id_vars="hand_index", var_name="serie", value_name="cum_val")
-
-                        color_scale_bb = alt.Scale(
-                            domain=["Observerat (BB cumulative)", "Med rakeback (BB cumulative)"],
-                            range=["#7ec8ff", "#0066cc"]
-                        )
+                        color_scale_bb = alt.Scale(domain=["Observerat (BB cumulative)", "Med rakeback (BB cumulative)"],
+                                                   range=["#7ec8ff", "#0066cc"])
                         chart_bb = alt.Chart(plot_bb_df).mark_line().encode(
                             x="hand_index:Q",
                             y="cum_val:Q",
@@ -761,41 +690,34 @@ def main():
                         ).properties(width=800, height=350)
                         st.altair_chart(chart_bb, use_container_width=True)
 
-    # --- TOTAL (alla händer) ---
+    # --- TOTAL (alla händer) med per-stake estimerad rake/rakeback integrerat ---
     else:
         agg = aggregate_hands(all_hands)
         st.header("Total – alla händer")
-
+        # compute per-stake rake summary & totals
         per_stake_summary, totals = estimate_rake_per_stake_summary(all_hands, nl_rake_bb100, plo_rake_bb100, rakeback_pct)
 
+        # top metrics: Resultat, Händer, BB/100, Resultat + rakeback
         col1, col2, col3, col4 = st.columns(4)
         col1.metric("Resultat (€)", f"{agg['result_eur']:.2f}")
         col2.metric("Händer", agg["hands"])
         col3.metric("BB/100", f"{agg['bb100']:.2f}")
-
+        # totals may contain total_result_eur; if not, fall back to agg
         total_result = totals.get("total_result_eur", agg["result_eur"])
         total_est_rakeback = totals.get("total_est_rakeback_eur", 0.0)
         result_plus_rakeback = total_result + total_est_rakeback
         col4.metric("Resultat + rakeback (EUR)", f"{result_plus_rakeback:.2f}")
 
-        # Timlön
-        stats = compute_played_hours_and_hourly(all_hands, nl_rake_bb100, plo_rake_bb100, rakeback_pct)
-        colA, colB, colC = st.columns(3)
-        colA.metric("Speltid (h)", f"{stats['played_hours']:.2f}")
-        colB.metric("Timlön (€/h) inkl rakeback", f"{stats['hourly_eur_per_h']:.2f}")
-        colC.metric("Start→Slut (UTC)", f"{stats['start_utc']} → {stats['end_utc']}")
-
+        # Per stake (resultat)
         rows = []
         for stake, info in agg["stakes"].items():
-            rows.append({
-                "Stake": fix_encoding(stake),
-                "Händer": info["hands"],
-                "Result (€)": round(info["result_eur"], 2),
-                "BB/100": round(info["bb100"], 2),
-            })
+            rows.append({"Stake": fix_encoding(stake), "Händer": info["hands"],
+                         "Result (€)": round(info["result_eur"], 2), "BB/100": round(info["bb100"], 2)})
         st.subheader("Per stake (resultat)")
-        st.table(pd.DataFrame(rows))
+        df_stakes = pd.DataFrame(rows)
+        st.table(df_stakes)
 
+        # Integrerad per-stake rake summary (i Total-vyn, en tabell)
         rows_r = []
         for stake_label, info in per_stake_summary.items():
             rows_r.append({
@@ -810,16 +732,15 @@ def main():
             st.subheader("Per stake: estimerad rake & rakeback (integrerat)")
             st.table(pd.DataFrame(rows_r))
 
+        # summary totals (observerat + totals)
         st.subheader("Totalsammanfattning")
         col_a, col_b, col_c = st.columns(3)
         col_a.metric("Observerat resultat (EUR)", f"{total_result:.2f}")
         col_b.metric("Est. rake (EUR)", f"{totals['total_est_rake_eur']:.2f}")
         col_c.metric("Est. rakeback (EUR)", f"{totals['total_est_rakeback_eur']:.2f}")
 
-        st.caption(
-            "Timlön här räknar speltid som tiden mellan första och sista handen i urvalet (inkl pauser). "
-            "Rakeback är estimerad enligt BB/100-antaganden."
-        )
+        st.caption("Per-stake-tabellen visar estimerad rake och estimerad rakeback. "
+                   "Rakeback (BB/100) = (rake BB/100) * rakeback% för respektive stake.")
 
 
 if __name__ == "__main__":
