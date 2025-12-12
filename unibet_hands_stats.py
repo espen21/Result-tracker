@@ -129,6 +129,7 @@ def load_records_from_har_bytes(har_bytes: bytes, override_date: Optional[date] 
                 continue
             hand_id = h[0]
             saldo_before = h[1]
+            unix_date = h[2]
             pot_cent = h[3]
             level_id = h[5]
             table_id = h[6]
@@ -141,22 +142,12 @@ def load_records_from_har_bytes(har_bytes: bytes, override_date: Optional[date] 
             stake_label = refs.get(str(level_id), level_labels.get(level_id, f"Level {level_id}"))
 
             # Try to detect if `table_id` actually encodes a unix timestamp.
-            unix_date_val = None
-            try:
-                if isinstance(table_id, int):
-                    # If value looks like milliseconds epoch (>= 1e12), convert to seconds
-                    if table_id >= 10 ** 12:
-                        unix_date_val = table_id // 1000
-                    # If value looks like seconds epoch (>= 1e9), accept as seconds
-                    elif table_id >= 10 ** 9:
-                        unix_date_val = table_id
-            except Exception:
-                unix_date_val = None
+           
 
             # If we detected a unix timestamp, prefer that for `date` and `month` (UTC)
-            if unix_date_val is not None:
+            if unix_date is not None:
                 try:
-                    dt_unix = datetime.fromtimestamp(int(unix_date_val), tz=timezone.utc)
+                    dt_unix = datetime.fromtimestamp(int(unix_date), tz=timezone.utc)
                     day_str = dt_unix.strftime("%Y-%m-%d")
                     month_str = dt_unix.strftime("%Y-%m")
                 except Exception:
@@ -168,7 +159,7 @@ def load_records_from_har_bytes(har_bytes: bytes, override_date: Optional[date] 
                 "date": day_str,
                 "month": month_str,
                 "stake": stake_label,
-                "unix_date": unix_date_val,
+                "unix_date": unix_date,
                 "cards": cards,
                 "pot_eur": pot_eur,
                 "result_eur": result_eur,
@@ -202,42 +193,7 @@ def init_db(conn: sqlite3.Connection):
         conn.execute("CREATE INDEX IF NOT EXISTS idx_hands_date ON hands(date)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_hands_month ON hands(month)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_hands_stake ON hands(stake)")
-        # Migration: if an older DB has `table_id` column, try renaming it to `unix_date`.
-        try:
-            cur = conn.execute("PRAGMA table_info(hands)")
-            cols = {row[1] for row in cur.fetchall()}
-            if "table_id" in cols and "unix_date" not in cols:
-                try:
-                    conn.execute("ALTER TABLE hands RENAME COLUMN table_id TO unix_date")
-                except Exception:
-                    # If RENAME COLUMN isn't supported, attempt a manual copy migration
-                    conn.execute("BEGIN")
-                    conn.execute("ALTER TABLE hands RENAME TO hands_old")
-                    conn.execute("""
-                        CREATE TABLE hands (
-                            hand_id    INTEGER PRIMARY KEY,
-                            date       TEXT,
-                            month      TEXT,
-                            stake      TEXT,
-                            unix_date  INTEGER,
-                            cards      TEXT,
-                            pot_eur    REAL,
-                            result_eur REAL
-                        )
-                    """)
-                    # copy data, using table_id -> unix_date
-                    conn.execute("INSERT INTO hands (hand_id, date, month, stake, unix_date, cards, pot_eur, result_eur) SELECT hand_id, date, month, stake, table_id, cards, pot_eur, result_eur FROM hands_old")
-                    conn.execute("DROP TABLE hands_old")
-                    conn.execute("COMMIT")
-        except Exception:
-            # If anything goes wrong, don't block startup; keep original schema
-            pass
-        # Try to create unix_date index if the column exists; ignore errors if it doesn't
-        try:
-            conn.execute("CREATE INDEX IF NOT EXISTS idx_hands_unix_date ON hands(unix_date)")
-        except Exception:
-            pass
-
+        
 
 def insert_hands(conn: sqlite3.Connection, records):
     if not records:
@@ -530,7 +486,7 @@ def main():
         if df.empty:
             st.info("Inga händer att visa.")
         else:
-            df["Datum"] = pd.to_datetime(df["date"], errors="coerce")
+            df["Datum"] = pd.to_datetime(df["unix_date"], errors="coerce")
             df["Stake_label"] = df["stake"].apply(fix_encoding)
             col_f1, col_f2 = st.columns(2)
             stakes_all = sorted(df["Stake_label"].dropna().unique().tolist())
@@ -591,10 +547,10 @@ def main():
                         return str(u)
 
                 df_view["Unix_date"] = df_view.get("unix_date").apply(_fmt_unix)
-                out_cols = ["Datum_str", "Hand ID", "Stake_label", "Kort", "Pott (€)", "Result (€)", "BB"]
+                out_cols = [ "Hand ID", "Stake_label", "Kort", "Pott (€)", "Result (€)", "BB"]
                 # insert Unix_date right after Datum
-                out_cols = ["Datum_str", "Unix_date"] + out_cols[1:]
-                df_out = df_view[out_cols].rename(columns={"Datum_str": "Datum", "Stake_label": "Stake", "Unix_date": "Unix date (UTC)"})
+                out_cols = ["Unix_date"] + out_cols[1:]
+                df_out = df_view[out_cols].rename(columns={ "Unix_date": "Unix date (UTC)", "Stake_label": "Stake"})
                 st.caption(f"Visar {len(df_out)} av {total_matches} händer (filtrerade och begränsade).")
                 html_table = df_out.to_html(escape=False, index=False)
                 st.markdown(html_table, unsafe_allow_html=True)
