@@ -353,8 +353,8 @@ def main():
     # --- Rake-parametrar i sidopanel ---
     st.sidebar.header("Rake-inställningar (BB/100)")
     nl_rake_bb100 = st.sidebar.number_input("NL rake (BB/100)", value=8.0, min_value=0.0, step=0.5)
-    plo_rake_bb100 = st.sidebar.number_input("PLO rake (BB/100)", value=12.0, min_value=0.0, step=0.5)
-    rakeback_pct = st.sidebar.slider("Rakeback %", min_value=0, max_value=100, value=40, step=1) / 100.0
+    plo_rake_bb100 = st.sidebar.number_input("PLO rake (BB/100)", value=14.0, min_value=0.0, step=0.5)
+    rakeback_pct = st.sidebar.slider("Rakeback %", min_value=0, max_value=100, value=45, step=1) / 100.0
     st.sidebar.caption("Skriv in dina antaganden här. Dessa används för estimering per stake.")
 
     conn = get_connection(db_path)
@@ -667,6 +667,7 @@ def main():
         # Per stake (resultat)
         rows = []
         for stake, info in agg["stakes"].items():
+            print(info)
             rows.append({"Stake": fix_encoding(stake), "Händer": info["hands"],
                          "Result (€)": round(info["result_eur"], 2), "BB/100": round(info["bb100"], 2)})
         st.subheader("Per stake (resultat)")
