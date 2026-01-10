@@ -667,7 +667,7 @@ def main():
         # Per stake (resultat)
         rows = []
         for stake, info in agg["stakes"].items():
-            print(info)
+            
             rows.append({"Stake": fix_encoding(stake), "Händer": info["hands"],
                          "Result (€)": round(info["result_eur"], 2), "BB/100": round(info["bb100"], 2)})
         st.subheader("Per stake (resultat)")
