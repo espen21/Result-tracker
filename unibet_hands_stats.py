@@ -104,9 +104,11 @@ def load_records_from_har_bytes(har_bytes: bytes, override_date: Optional[date] 
         if the_date:
             day_str = the_date.strftime("%Y-%m-%d")
             month_str = the_date.strftime("%Y-%m")
+            year_str = the_date.strftime("%Y")
         else:
             day_str = None
             month_str = None
+            year_str = None
 
         content = entry.get("response", {}).get("content", {}) or {}
         text = content.get("text") or ""
@@ -150,14 +152,16 @@ def load_records_from_har_bytes(har_bytes: bytes, override_date: Optional[date] 
                     dt_unix = datetime.fromtimestamp(int(unix_date), tz=timezone.utc)
                     day_str = dt_unix.strftime("%Y-%m-%d")
                     month_str = dt_unix.strftime("%Y-%m")
+                    year_str = dt_unix.strftime("%Y")
                 except Exception:
-                    # fallback: keep previously computed day_str/month_str
+                    # fallback: keep previously computed day_str/month_str/year_str
                     pass
 
             records.append({
                 "hand_id": hand_id,
                 "date": day_str,
                 "month": month_str,
+                "year": year_str,
                 "stake": stake_label,
                 "unix_date": unix_date,
                 "cards": cards,
@@ -338,6 +342,19 @@ def aggregate_by_month(all_hands):
     return {m: aggregate_hands(recs) for m, recs in by_month.items()}
 
 
+def aggregate_by_year(all_hands):
+    by_year = defaultdict(list)
+    for r in all_hands:
+        year = r.get("year")
+        if not year and r.get("date"):
+            try:
+                year = r["date"][:4]
+            except Exception:
+                year = None
+        if year:
+            by_year[year].append(r)
+    return {y: aggregate_hands(recs) for y, recs in by_year.items()}
+
 # ------------------------ STREAMLIT GUI ------------------------ #
 
 def main():
@@ -389,7 +406,7 @@ def main():
 
     st.sidebar.write(f"Totalt antal händer: **{len(all_hands)}**")
 
-    view = st.radio("Vy", ["Per dag", "Per månad", "Alla dagar (tabell + grafer)", "Alla händer (sortable)",
+    view = st.radio("Vy", ["Per dag", "Per månad", "Per år", "Alla dagar (tabell + grafer)", "Alla händer (sortable)",
                           "Graf – kumulativ resultatkurva", "Total (alla händer)"])
 
     # --- PER DAG ---
@@ -453,6 +470,45 @@ def main():
             col4.metric("Est. rakeback (EUR)", f"{est_rb_m:.2f}")
         else:
             col4.metric("Est. rakeback (EUR)", "0.00")
+        rows = []
+        for stake, info in agg["stakes"].items():
+            rows.append({"Stake": fix_encoding(stake), "Händer": info["hands"],
+                         "Result (€)": round(info["result_eur"], 2), "BB/100": round(info["bb100"], 2)})
+        st.subheader("Per stake")
+        st.table(pd.DataFrame(rows))
+
+    # --- PER ÅR ---
+    elif view == "Per år":
+        from collections import defaultdict as _dd
+        records_by_year = _dd(list)
+        for r in all_hands:
+            year = r.get("year")
+            if not year and r.get("date"):
+                try:
+                    year = r["date"][:4]
+                except Exception:
+                    year = None
+            if year:
+                records_by_year[year].append(r)
+
+        per_year = aggregate_by_year(all_hands)
+        years = sorted(per_year.keys(), reverse=True)
+        chosen = st.selectbox("År", years)
+        agg = per_year[chosen]
+        st.header(f"År: {chosen}")
+        col1, col2, col3, col4 = st.columns(4)
+        col1.metric("Resultat (€)", f"{agg['result_eur']:.2f}")
+        col2.metric("Händer", agg["hands"])
+        col3.metric("BB/100", f"{agg['bb100']:.2f}")
+
+        year_records = records_by_year.get(chosen, [])
+        if year_records:
+            _, year_totals = estimate_rake_per_stake_summary(year_records, nl_rake_bb100, plo_rake_bb100, rakeback_pct)
+            est_rb_y = year_totals.get("total_est_rakeback_eur", 0.0)
+            col4.metric("Est. rakeback (EUR)", f"{est_rb_y:.2f}")
+        else:
+            col4.metric("Est. rakeback (EUR)", "0.00")
+
         rows = []
         for stake, info in agg["stakes"].items():
             rows.append({"Stake": fix_encoding(stake), "Händer": info["hands"],
